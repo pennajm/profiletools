@@ -21,6 +21,7 @@
 from __future__ import division
 
 from .core import Profile, Channel, read_csv, read_NetCDF
+from . import transformations
 
 import warnings
 try:
@@ -36,6 +37,10 @@ import scipy.interpolate
 import scipy.stats
 import gptools
 import matplotlib.pyplot as plt
+try:
+    import TRIPPy
+except ImportError:
+    warnings.warn("Module TRIPPy could not be loaded!", RuntimeWarning)
 
 _X_label_mapping = {'psinorm': r'$\psi_n$',
                     'phinorm': r'$\phi_n$',
@@ -59,18 +64,27 @@ _X_unit_mapping = {'psinorm': '',
 
 class BivariatePlasmaProfile(Profile):
     """Class to represent bivariate (y=f(t, psi)) plasma data.
-
+    
     The first column of `X` is always time. If the abscissa is 'RZ', then the
     second column is `R` and the third is `Z`. Otherwise the second column is
     the desired abscissa (psinorm, etc.).
     """
+    
+    def remake_efit_tree(self):
+        """Remake the EFIT tree.
+        
+        This is needed since EFIT tree instances aren't pickleable yet, so to
+        store a :py:class:`BivariatePlasmaProfile` in a pickle file, you must
+        delete the EFIT tree.
+        """
+        self.efit_tree = eqtools.CModEFITTree(self.shot)
     
     def convert_abscissa(self, new_abscissa, drop_nan=True, ddof=1):
         """Convert the internal representation of the abscissa to new coordinates.
         
         The target abcissae are what are supported by `rho2rho` from the
         `eqtools` package. Namely,
-
+        
             ======= ========================
             psinorm Normalized poloidal flux
             phinorm Normalized toroidal flux
@@ -78,10 +92,10 @@ class BivariatePlasmaProfile(Profile):
             Rmid    Midplane major radius
             r/a     Normalized minor radius
             ======= ========================
-                
+        
         Additionally, each valid option may be prepended with 'sqrt' to return
         the square root of the desired normalized unit.
-
+        
         Parameters
         ----------
         new_abscissa : str
@@ -309,7 +323,7 @@ class BivariatePlasmaProfile(Profile):
         times : array of float
             The values the time should be close to.
         **kwargs : optional kwargs
-            All additional kwargs are passed to :py:meth:`~gptools.core.Channel.keep_slices`.
+            All additional kwargs are passed to :py:meth:`~profiletools.core.Profile.keep_slices`.
         """
         if self.X_labels[0] != '$t$':
             raise ValueError("Cannot keep specific time slices after time-averaging!")
@@ -352,31 +366,32 @@ class BivariatePlasmaProfile(Profile):
             converted to psinorm and the points will be dropped. Default is True
             (allow conversion).
         """
-        if self.abscissa == 'RZ':
-            if allow_conversion:
-                warnings.warn(
-                    "Removal of edge points not supported with abscissa RZ. Will "
-                    "convert to psinorm."
-                )
-                self.convert_abscissa('psinorm')
+        if self.X is not None:
+            if self.abscissa == 'RZ':
+                if allow_conversion:
+                    warnings.warn(
+                        "Removal of edge points not supported with abscissa RZ. Will "
+                        "convert to psinorm."
+                    )
+                    self.convert_abscissa('psinorm')
+                else:
+                    raise ValueError(
+                        "Removal of edge points not supported with abscissa RZ!"
+                    )
+            if 'r/a' in self.abscissa or 'norm' in self.abscissa:
+                x_out = 1.0
+            elif self.abscissa == 'Rmid':
+                if self.X_dim == 1:
+                    t_EFIT = self._get_efit_times_to_average()
+                    x_out = scipy.mean(self.efit_tree.getRmidOutSpline()(t_EFIT))
+                else:
+                    assert self.X_dim == 2
+                    x_out = self.efit_tree.getRmidOutSpline()(scipy.asarray(self.X[:, 0]).ravel())
             else:
                 raise ValueError(
-                    "Removal of edge points not supported with abscissa RZ!"
+                    "Removal of edge points not supported with abscissa %s!" % (self.abscissa,)
                 )
-        if 'r/a' in self.abscissa or 'norm' in self.abscissa:
-            x_out = 1.0
-        elif self.abscissa == 'Rmid':
-            if self.X_dim == 1:
-                t_EFIT = self._get_efit_times_to_average()
-                x_out = scipy.mean(self.efit_tree.getRmidOutSpline()(t_EFIT))
-            else:
-                assert self.X_dim == 2
-                x_out = self.efit_tree.getRmidOutSpline()(scipy.asarray(self.X[:, 0]).ravel())
-        else:
-            raise ValueError(
-                "Removal of edge points not supported with abscissa %s!" % (self.abscissa,)
-            )
-        self.remove_points((self.X[:, -1] >= x_out) | scipy.isnan(self.X[:, -1]))
+            self.remove_points((self.X[:, -1] >= x_out) | scipy.isnan(self.X[:, -1]))
     
     def constrain_slope_on_axis(self, err=0, times=None):
         """Constrains the slope at the magnetic axis of this Profile's Gaussian process to be zero.
@@ -531,8 +546,8 @@ class BivariatePlasmaProfile(Profile):
                   axis_constraint_kwargs={}, limiter_constraint_kwargs={}, **kwargs):
         """Create a Gaussian process to handle the data.
         
-        Calls :py:meth:`Profile.create_gp`, then imposes constraints as
-        requested.
+        Calls :py:meth:`~profiletools.core.Profile.create_gp`, then imposes
+        constraints as requested.
         
         Defaults to using a squared exponential kernel in two dimensions or a
         Gibbs kernel with tanh warping in one dimension.
@@ -738,6 +753,7 @@ class BivariatePlasmaProfile(Profile):
             else:
                 # Compute using error propagation:
                 mean_a_L = -mean_a * mean_grad * mean_dX_dRmid / mean_val
+                # TODO: This needs to change for X=r/a!
                 std_a_L = scipy.sqrt(
                     var_a * (mean_grad * mean_dX_dRmid / mean_val)**2 +
                     var_val * (-mean_a * mean_grad * mean_dX_dRmid / mean_val**2)**2 +
@@ -785,7 +801,7 @@ class BivariatePlasmaProfile(Profile):
                       'mean_a_L': mean_a_L,
                       'std_a_L': std_a_L,
                       'cov': cov,
-                      'out': out,
+                      # 'out': out,
                       'special_mean': special_mean,
                       'special_cov': special_cov
                      }
@@ -796,7 +812,7 @@ class BivariatePlasmaProfile(Profile):
                 retval['std_a_L_grad'] = std_a_L_grad
                 retval['mean_a2_2'] = mean_a2_2
                 retval['std_a2_2'] = std_a2_2
-            if predict_kwargs.get('full_MC', False):
+            if predict_kwargs.get('full_MC', False) or predict_kwargs.get('return_samples', False):
                 retval['samp'] = out['samp']
             return retval
         else:
@@ -865,16 +881,18 @@ class BivariatePlasmaProfile(Profile):
                         each_t=True
                     )
                     rho_grid = scipy.mean(rho_grid, axis=0)
+                    # Correct for the NaN that shows up sometimes:
+                    rho_grid[0] = 0.0
                 else:
                     if self.abscissa.startswith('sqrt'):
                         rho_grid = scipy.sqrt(vol_grid)
                     else:
                         rho_grid = vol_grid
-            
+                
                 N = npts - 1
                 a = 0
                 b = 1
-            
+                
                 # Use the trapezoid rule:
                 weights = 2 * scipy.ones_like(vol_grid)
                 weights[0] = 1
@@ -963,7 +981,7 @@ class BivariatePlasmaProfile(Profile):
                 if not predict_kwargs.get('use_MCMC', False):
                     self.find_gp_MAP_estimate(**MAP_kwargs)
             rho_grid, weights = self._make_volume_averaging_matrix(rho_grid=grid, npts=npts)
-        
+            
             res = self.gp.predict(
                 rho_grid,
                 output_transform=weights,
@@ -1092,12 +1110,12 @@ def neCTS(shot, abscissa='RZ', t_min=None, t_max=None, electrons=None,
                                y_units='$10^{20}$ m$^{-3}$',
                                X_labels=['$t$', '$R$', '$Z$'],
                                y_label='$n_e$, CTS')
-
+    
     if electrons is None:
         electrons = MDSplus.Tree('electrons', shot)
-
+    
     N_ne_TS = electrons.getNode(r'\electrons::top.yag_new.results.profiles:ne_rz')
-
+    
     t_ne_TS = N_ne_TS.dim_of().data()
     ne_TS = N_ne_TS.data() / 1e20
     dev_ne_TS = electrons.getNode(r'yag_new.results.profiles:ne_err').data() / 1e20
@@ -1128,25 +1146,31 @@ def neCTS(shot, abscissa='RZ', t_min=None, t_max=None, electrons=None,
     p.abscissa = 'RZ'
     
     p.add_data(X, ne, err_y=err_ne, channels={1: channels, 2: channels})
+    
     # Remove flagged points:
-    p.remove_points(scipy.isnan(p.err_y) | (p.err_y == 0.0) | scipy.isinf(p.err_y))
-    if remove_zeros:
-        p.remove_points(p.y == 0.0)
+    p.remove_points(
+        scipy.isnan(p.err_y) |
+        scipy.isinf(p.err_y) |
+        (p.err_y == 0.0) |
+        (p.err_y == 1.0) |
+        (p.err_y == 2.0) |
+        ((p.y == 0.0) & remove_zeros)
+    )
     if t_min is not None:
         p.remove_points(scipy.asarray(p.X[:, 0]).flatten() < t_min)
     if t_max is not None:
         p.remove_points(scipy.asarray(p.X[:, 0]).flatten() > t_max)
     p.convert_abscissa(abscissa)
-
+    
     if remove_edge:
         p.remove_edge_points()
-
+    
     return p
 
 def neETS(shot, abscissa='RZ', t_min=None, t_max=None, electrons=None,
-          efit_tree=None, remove_edge=False):
+          efit_tree=None, remove_edge=False, remove_zeros=True):
     """Returns a profile representing electron density from the edge Thomson scattering system.
-
+    
     Parameters
     ----------
     shot : int
@@ -1166,6 +1190,10 @@ def neETS(shot, abscissa='RZ', t_min=None, t_max=None, electrons=None,
     remove_edge : bool, optional
         If True, will remove points that are outside the LCFS. It will convert
         the abscissa to psinorm if necessary. Default is False (keep edge).
+    remove_zeros: bool, optional
+        If True, will remove points that are identically zero. Default is False
+        (keep zero points). This was added because clearly bad points aren't
+        always flagged with a sentinel value of errorbar.
     """
     p = BivariatePlasmaProfile(X_dim=3,
                                X_units=['s', 'm', 'm'],
@@ -1209,23 +1237,183 @@ def neETS(shot, abscissa='RZ', t_min=None, t_max=None, electrons=None,
     
     p.add_data(X, ne, err_y=err_ne, channels={1: channels, 2: channels})
     # Remove flagged points:
-    p.remove_points(scipy.isnan(p.err_y) | (p.err_y == 0.0) |
-                    ((p.y == 0.0) & (p.err_y == 2)) | scipy.isinf(p.err_y))
+    try:
+        pm = electrons.getNode(r'yag_edgets.data:pointmask').data().flatten()
+    except MDSplus.TreeException:
+        pm = scipy.ones_like(p.y)
+    p.remove_points(
+        (pm == 0) |
+        scipy.isnan(p.err_y) |
+        scipy.isinf(p.err_y) |
+        (p.err_y == 0.0) |
+        (p.err_y == 1.0) |
+        (p.err_y == 2.0) |
+        ((p.y == 0.0) & remove_zeros)
+    )
     if t_min is not None:
         p.remove_points(scipy.asarray(p.X[:, 0]).flatten() < t_min)
     if t_max is not None:
         p.remove_points(scipy.asarray(p.X[:, 0]).flatten() > t_max)
     p.convert_abscissa(abscissa)
-
+    
     if remove_edge:
         p.remove_edge_points()
-
+    
     return p
 
-def neTCI(shot, abscissa='RZ', t_min=None, t_max=None, electrons=None,
-           efit_tree=None, npts=20, flag_threshold=1e-3):
+def neTCI(shot, abscissa='r/a', t_min=None, t_max=None, electrons=None,
+          efit_tree=None, quad_points=20, Z_point=-3.0, theta=scipy.pi / 4,
+          thin=1, flag_threshold=1e-3, ds=1e-3):
     """Returns a profile representing electron density from the two color interferometer system.
 
+    Parameters
+    ----------
+    shot : int
+        The shot number to load.
+    abscissa : str, optional
+        The abscissa to use for the data. The default is 'r/a'.
+    t_min : float, optional
+        The smallest time to include. Default is None (no lower bound).
+    t_max : float, optional
+        The largest time to include. Default is None (no upper bound).
+    electrons : :py:class:`MDSplus.Tree`, optional
+        An :py:class:`MDSplus.Tree` instance open to the electrons tree of the
+        correct shot. The shot of the given tree is not checked! Default is None
+        (open tree).
+    efit_tree : :py:class`eqtools.CModEFITTree`, optional
+        An :py:class:`eqtools.CModEFITTree` instance open to the correct shot.
+        The shot of the given tree is not checked! Default is None (open tree).
+    quad_points : int or array of float, optional
+        The quadrature points to use. If an int, then `quad_points` linearly-
+        spaced points between 0 and 1.2 will be used. Otherwise, `quad_points`
+        must be a strictly monotonically increasing array of the quadrature
+        points to use.
+    Z_point : float
+        Z coordinate of the starting point of the rays (should be well outside
+        the tokamak). Units are meters.
+    theta : float
+        Angle of the chords. Units are radians.
+    thin : int
+        Amount by which the data are thinned before computing weights and
+        averages. Default is 1 (no thinning).
+    flag_threshold : float, optional
+        The threshold below which points are considered bad. Default is 1e-3.
+    ds : float, optional
+        The step size TRIPPy uses to form the beam. Default is 1e-3
+    """
+    if abscissa in ('RZ', 'phinorm', 'volnorm', 'sqrtphinorm', 'sqrtvolnorm'):
+        raise ValueError("Abscissa '%s' not supported for neTCI!" % (abscissa,))
+    
+    # This is redundant with the definition in the function fingerprint, and
+    # must be changed at the same time.
+    if quad_points is None:
+        quad_points = 20
+    if flag_threshold is None:
+        flag_threshold = 1e-3
+    if thin is None:
+        flag_threshold = 1
+    if ds is None:
+        ds = 1e-3
+    
+    try:
+        iter(quad_points)
+    except TypeError:
+        if abscissa == 'Rmid':
+            warnings.warn(
+                "Automatically-generated quadrature points for abscissa 'Rmid' "
+                "will not work right!"
+            )
+            # TODO: We need a way of setting these bounds for Rmid!
+        quad_points = scipy.linspace(0, 1.2, quad_points)
+    else:
+        quad_points = scipy.asarray(quad_points, dtype=float)
+    
+    p = BivariatePlasmaProfile(
+        X_dim=2,
+        X_units=['s', _X_unit_mapping[abscissa]],
+        y_units='$10^{20}$ m$^{-3}$',
+        X_labels=['$t$', _X_label_mapping[abscissa]],
+        y_label='$n_e$, TCI',
+        weightable=False
+    )
+    
+    if efit_tree is None:
+        p.efit_tree = eqtools.CModEFITTree(shot)
+    else:
+        p.efit_tree = efit_tree
+    
+    p.abscissa = abscissa
+    p.shot = shot
+    
+    if electrons is None:
+        electrons = MDSplus.Tree('electrons', shot)
+    
+    R = electrons.getNode(r'tci.results:rad').data()
+    
+    # Set these to None here to solve the fencepost problem:
+    T = None
+    mask = None
+    for i, r in enumerate(R):
+        N_NL = electrons.getNode(r'tci.results:nl_%02d' % (i + 1,))
+        ne = N_NL.data()
+        t_ne = N_NL.dim_of().data()
+        
+        # Put in the len(t_ne) > 0 catch in case the first chord(s) happen to be
+        # bad/empty:
+        if mask is None and len(t_ne) > 0:
+            if t_min is None:
+                t_min = t_ne.min()
+            if t_max is None:
+                t_max = t_ne.max()
+            
+            mask = (t_ne >= t_min) & (t_ne <= t_max)
+        
+        ne = ne[mask]
+        ne = ne[::thin]
+        t_ne = t_ne[mask]
+        t_ne = t_ne[::thin]
+        
+        if T is None and len(t_ne) > 0:
+            T = transformations.get_transforms(
+                abscissa,
+                R,
+                p.efit_tree,
+                t_ne,
+                quad_points,
+                Z_point,
+                theta,
+                ds=ds
+            )
+        
+        good = ne >= flag_threshold
+        
+        t_ne = t_ne[good]
+        
+        if len(t_ne) > 0:
+            ne = ne[good]
+            # not all channels are active, catch that when putting in the channel transforms and coords
+            X = scipy.ones((len(t_ne), len(quad_points), 2))
+            X = scipy.einsum('i,ijk->ijk', t_ne, X)
+            X[:, :, 1] = quad_points
+                       
+            p.transformed = scipy.append(
+                p.transformed,
+                Channel(
+                    X,
+                    ne / 1e20,
+                    err_y=0.1 * ne / 1e20,
+                    T=T[good, i, :],
+                    y_label='nl_%02d' % (i + 1,),
+                    y_units='$10^{20}$ m$^{-2}$'
+                )
+            )
+    
+    return p
+
+def neTCI_old(shot, abscissa='RZ', t_min=None, t_max=None, electrons=None,
+          efit_tree=None, npts=100, flag_threshold=1e-3):
+    """Returns a profile representing electron density from the two color interferometer system.
+    
     Parameters
     ----------
     shot : int
@@ -1247,6 +1435,12 @@ def neTCI(shot, abscissa='RZ', t_min=None, t_max=None, electrons=None,
     flag_threshold : float, optional
         The threshold below which points are considered bad. Default is 1e-3.
     """
+    # Note that the defaults here are redundant with the function definition:
+    # they must be changed at the same time.
+    if npts is None:
+        npts = 100
+    if flag_threshold is None:
+        flag_threshold = 1e-3
     p = BivariatePlasmaProfile(
         X_dim=3,
         X_units=['s', 'm', 'm'],
@@ -1274,7 +1468,7 @@ def neTCI(shot, abscissa='RZ', t_min=None, t_max=None, electrons=None,
     weights *= (Z.max() - Z.min()) / (2 * (len(Z) - 1))
     
     mask = None
-    for i, r in zip(range(0, 10), R):
+    for i, r in zip(range(0, len(R)), R):
         N_NL = electrons.getNode(r'tci.results:nl_%02d' % (i + 1,))
         ne = N_NL.data()
         t_ne = N_NL.dim_of().data()
@@ -1391,7 +1585,8 @@ def neReflect(shot, abscissa='Rmid', t_min=None, t_max=None, electrons=None,
 
     return p
 
-def ne(shot, include=['CTS', 'ETS'], TCI_npts=100, TCI_flag_threshold=1e-3, **kwargs):
+def ne(shot, include=['CTS', 'ETS'], TCI_quad_points=None, TCI_flag_threshold=None,
+       TCI_thin=None, TCI_ds=None, **kwargs):
     """Returns a profile representing electron density from both the core and edge Thomson scattering systems.
 
     Parameters
@@ -1427,8 +1622,10 @@ def ne(shot, include=['CTS', 'ETS'], TCI_npts=100, TCI_flag_threshold=1e-3, **kw
             p_list.append(
                 neTCI(
                     shot,
-                    npts=TCI_npts,
+                    quad_points=TCI_quad_points,
                     flag_threshold=TCI_flag_threshold,
+                    thin=TCI_thin,
+                    ds=TCI_ds,
                     **kwargs
                 )
             )
@@ -1511,9 +1708,13 @@ def TeCTS(shot, abscissa='RZ', t_min=None, t_max=None, electrons=None,
     
     p.add_data(X, Te, err_y=err_Te, channels={1: channels, 2: channels})
     # Remove flagged points:
-    p.remove_points(scipy.isnan(p.err_y) | (p.err_y == 0.0) | scipy.isinf(p.err_y))
-    if remove_zeros:
-        p.remove_points(p.y == 0.0)
+    p.remove_points(
+        scipy.isnan(p.err_y) |
+        scipy.isinf(p.err_y) |
+        (p.err_y == 0.0) |
+        (p.err_y == 1.0) |
+        ((p.y == 0.0) & remove_zeros)
+    )
     if t_min is not None:
         p.remove_points(scipy.asarray(p.X[:, 0]).flatten() < t_min)
     if t_max is not None:
@@ -1526,7 +1727,7 @@ def TeCTS(shot, abscissa='RZ', t_min=None, t_max=None, electrons=None,
     return p
 
 def TeETS(shot, abscissa='RZ', t_min=None, t_max=None, electrons=None,
-          efit_tree=None, remove_edge=False):
+          efit_tree=None, remove_edge=False, remove_zeros=False):
     """Returns a profile representing electron temperature from the edge Thomson scattering system.
 
     Parameters
@@ -1591,21 +1792,30 @@ def TeETS(shot, abscissa='RZ', t_min=None, t_max=None, electrons=None,
     
     p.add_data(X, Te, err_y=err_Te, channels={1: channels, 2: channels})
     # Remove flagged points:
+    try:
+        pm = electrons.getNode(r'yag_edgets.data:pointmask').data().flatten()
+    except MDSplus.TreeException:
+        pm = scipy.ones_like(p.y)
     p.remove_points(
+        (pm == 0) |
         scipy.isnan(p.err_y) |
+        scipy.isinf(p.err_y) |
         (p.err_y == 0.0) |
-        ((p.y == 0) & (p.err_y == 1)) |
-        scipy.isinf(p.err_y)
+        (p.err_y == 1.0) |
+        (p.err_y == 0.5) |
+        ((p.y == 0.0) & remove_zeros) |
+        ((p.y == 0) & (p.err_y == 0.029999999329447746))  # This seems to be an old way of flagging. Could be risky...
     )
+    
     if t_min is not None:
         p.remove_points(scipy.asarray(p.X[:, 0]).flatten() < t_min)
     if t_max is not None:
         p.remove_points(scipy.asarray(p.X[:, 0]).flatten() > t_max)
     p.convert_abscissa(abscissa)
-
+    
     if remove_edge:
         p.remove_edge_points()
-
+    
     return p
 
 def TeFRCECE(shot, rate='s', cutoff=0.15, abscissa='Rmid', t_min=None, t_max=None,
@@ -1769,7 +1979,7 @@ def TeGPC2(shot, abscissa='Rmid', t_min=None, t_max=None, electrons=None,
     p.add_data(X, Te, channels={1: channels}, err_y=0.1 * scipy.absolute(Te))
     
     # Remove flagged points:
-    p.remove_points(p.y == 0)
+    p.remove_points(p.y <= 0)
     if t_min is not None:
         p.remove_points(scipy.asarray(p.X[:, 0]).flatten() < t_min)
     if t_max is not None:
